@@ -343,7 +343,9 @@ class LPArbitrageControl(SystemLevelControlBase):
         breaks if storage is sized by a design variable or an upstream sizing
         model. Reading the connected inputs once they are populated, and
         rebuilding the variable bounds when they change, would remove the
-        restriction.
+        restriction. NOTE: this may no longer be relevant; revisit if we can
+        reasonably use the connected variables directly here instead of reading
+        from the config file.
 
         TODO: Capture the state-dependent parameters other storage technologies
         need. There is no self-discharge or boil-off rate, no standby power, no
@@ -507,6 +509,7 @@ class LPArbitrageControl(SystemLevelControlBase):
 
         # --- Constraints ---------------------------------------------------
         def _balance_rule(m, t):
+            """Require supply and use of the controlled commodity to match in each timestep."""
             supply = (
                 m.must_run[t]
                 + sum(m.discharge[s, t] for s in m.S)
@@ -519,6 +522,7 @@ class LPArbitrageControl(SystemLevelControlBase):
         model.balance = pyo.Constraint(model.T, rule=_balance_rule)
 
         def _soc_rule(m, s, t):
+            """Advance a storage technology's state of charge by its net flow, after losses."""
             previous = m.soc_init[s] if t == 0 else m.soc[s, t - 1]
             charged = m.charge[s, t] * storage_params[s]["charge_efficiency"]
             discharged = m.discharge[s, t] / storage_params[s]["discharge_efficiency"]
@@ -527,15 +531,16 @@ class LPArbitrageControl(SystemLevelControlBase):
         model.soc_balance = pyo.Constraint(model.S, model.T, rule=_soc_rule)
 
         def _rated_rule(m, d, t):
+            """Cap a dispatchable technology's output at its rated production."""
             return m.dispatch[d, t] <= m.rated[d]
 
         model.rated_limit = pyo.Constraint(model.D, model.T, rule=_rated_rule)
 
         def _charge_availability_rule(m, t):
-            # Mirrors the ``charge_available`` clip in the storage performance
-            # model: storage can only absorb commodity that is present on the
-            # bus this timestep. Import technologies count toward availability,
-            # which is what makes grid charging possible.
+            """Limit total charging to the commodity actually present on the bus this timestep."""
+            # Mirrors the ``charge_available`` clip in the storage performance model.
+            # Import technologies count toward availability, which is what makes grid
+            # charging possible.
             return sum(m.charge[s, t] for s in m.S) <= m.must_run[t] + sum(
                 m.dispatch[d, t] for d in m.D
             )
@@ -544,6 +549,7 @@ class LPArbitrageControl(SystemLevelControlBase):
 
         # --- Objective -----------------------------------------------------
         def _objective_rule(m):
+            """Return window profit, plus the value of the commodity left in storage."""
             revenue = sum(m.sell_price[t] * m.export[t] for t in m.T)
             generation_cost = sum(
                 m.marginal_cost[d, t] * m.dispatch[d, t] for d in m.D for t in m.T
