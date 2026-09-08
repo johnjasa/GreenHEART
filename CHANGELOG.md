@@ -24,6 +24,14 @@
   - Added an `uncontrolled_components` key to the system-level control configuration so a pre-existing plant can be physically connected without the controller dispatching it or counting its output as available supply.
   - Added an `export_limit_profile` input to `GridPerformanceModel` so a time-varying export ceiling is physically enforced rather than only respected inside the controller.
   - Added example 35 `lp_arbitrage`, a solar plus battery addition to an existing plant that arbitrages a synthetic hourly locational marginal price series, valued with `ProFastNPV` at the realized volume-weighted export price and reported with dispatch and economics figures.
+- Fixed some units in the resource models (`C` converted to `degC`, etc) and refactored inheritance of baseclasses for existing resource models [PR 858](https://github.com/NatLabRockies/H2Integrate/pull/858)
+- Add resource models that can extract resource data from NLR resource datasets using the `rex` package [PR 854](https://github.com/NatLabRockies/H2Integrate/pull/854)
+  - `WTKHRRRMETDatasetH5` to access data from the WTK HRRR MET dataset
+  - `NSRDBDatasetH5` to access data from the NSRDB dataset
+  - `ResourceBaseH5Config` and `ResourceBaseH5Model` are base configuration classes for these resource datasets
+- Synced peak load management (PLM) with the system-level control (SLC) paradigm: `PeakLoadManagementOptimizedStorageController` can now be used as a storage tech's SLC sub-controller via a new opt-in `constrain_dispatch_to_set_point` config field, which caps dispatch at the provided demand signal without changing its existing peak-window behavior by default. [Issue 749](https://github.com/NatLabRockies/H2Integrate/issues/749)
+- Bugfix in LCO breakdown function to include sales tax and typo-fix in commodity units extraction in ProFAST finance models [PR 867](https://github.com/NatLabRockies/H2Integrate/pull/867)
+- Expanded ability to connect site information (such as latitude and longitude) to technologies and added the transport cost model `LinearDistanceCostModel` [PR 865](https://github.com/NatLabRockies/H2Integrate/pull/865)
 
 ## 0.9 [August 10, 2026]
 
@@ -93,6 +101,7 @@
 - Adds `feedstock_dir` to the EIA natural gas retrieval to align the downloading or loading of the feedstock data with the resource data methodology [PR 801](https://github.com/NatLabRockies/H2Integrate/pull/801).
 - Add support for slice notation in technology connections to allow users to connect between variables of different shapes. [PR 774](https://github.com/NatLabRockies/H2Integrate/pull/774)
 - Updated edge attribute `commodity` of in `H2Integrate.create_technology_graph` to use lists instead of strings to account for systems with multiple commodities connected between two technologies [PR 823](https://github.com/NatLabRockies/H2Integrate/pull/823)
+- Added two new fuel cell models: `PEMH2FuelCellPerformanceModel` to model a PEM hydrogen fuel cell and `SONGFuelCellPerformanceModel` to model a natural gas solid oxide fuel cell [PR 794](https://github.com/NatLabRockies/H2Integrate/pull/794)
 
 ### Fixes
 - Bug fix so multi-level output path won't throw an error; updated test for EIA API handling. [PR 820](https://github.com/NatLabRockies/H2Integrate/pull/820)
