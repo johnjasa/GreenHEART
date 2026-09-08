@@ -1,9 +1,11 @@
-"""LP-based energy arbitrage for a merchant solar plus battery plant.
+"""LP-based energy arbitrage for a solar plus battery addition to an existing plant.
 
 A synthetic hourly locational marginal price (LMP) series drives both the
 export price and the import price. The system-level controller solves a rolling
 24-hour linear program that decides, simultaneously, when to charge the battery
-(from solar or from the grid), when to discharge, and how much to export.
+(from solar, from the existing plant's spill, or from the grid), when to
+discharge, and how much to export. Export is capped at the existing plant's
+unmet demand, so only the value of the addition is counted.
 """
 
 import numpy as np
@@ -74,6 +76,12 @@ battery_charge = -h2i.prob.get_val("plant.battery.storage_electricity_charge", u
 battery_soc = h2i.prob.get_val("plant.battery.SOC", units="percent")
 grid_import = h2i.prob.get_val("plant.grid_buy.electricity_out", units="kW")
 grid_export = h2i.prob.get_val("plant.grid_sell.electricity_sold", units="kW")
+# The existing plant's shortfall is the export ceiling; its spill is chargeable supply.
+export_ceiling = h2i.prob.get_val(
+    "plant.existing_load_demand.unmet_electricity_demand_out", units="kW"
+)
+existing_spill = h2i.prob.get_val("plant.existing_load_demand.unused_electricity_out", units="kW")
+interconnection_limit = h2i.prob.get_val("plant.grid_sell.interconnection_size", units="kW").item()
 
 dt_h = 1.0
 export_revenue = float(np.sum(grid_export * lmp) * dt_h)
@@ -119,7 +127,7 @@ n_hours = 168
 window = slice(start, start + n_hours)
 hours = np.arange(n_hours)
 
-fig, axes = plt.subplots(4, 1, figsize=(14, 12), sharex=True)
+fig, axes = plt.subplots(5, 1, figsize=(14, 15), sharex=True)
 
 axes[0].plot(hours, lmp[window] * 100, color="tab:red")
 axes[0].axhline(0.0, color="k", linewidth=0.8, linestyle=":")
@@ -165,9 +173,65 @@ ax_soc = axes[2].twinx()
 ax_soc.plot(hours, battery_soc[window], color="k", linewidth=1.2, label="SOC")
 ax_soc.set_ylabel("SOC (%)")
 
-axes[3].bar(hours, grid_export[window] / 1e3, width=1.0, color="tab:blue", align="edge")
+axes[3].bar(
+    hours,
+    grid_export[window] / 1e3,
+    width=1.0,
+    color="tab:blue",
+    align="edge",
+    label="Export",
+)
+axes[3].step(
+    hours,
+    export_ceiling[window] / 1e3,
+    where="post",
+    color="tab:red",
+    linewidth=1.6,
+    label="Export ceiling (existing plant's unmet demand)",
+)
+axes[3].fill_between(
+    hours,
+    export_ceiling[window] / 1e3,
+    interconnection_limit / 1e3,
+    step="post",
+    color="tab:red",
+    alpha=0.08,
+    label="Blocked by the ceiling",
+)
+axes[3].axhline(
+    interconnection_limit / 1e3,
+    color="k",
+    linewidth=1.0,
+    linestyle="--",
+    label="Interconnection limit",
+)
 axes[3].set_ylabel("Export (MW)")
-axes[3].set_xlabel("Hour of week")
+axes[3].legend(loc="upper right", fontsize=8)
+
+# The existing plant alternates between spilling and falling short, and those two
+# signals are what the addition is allowed to charge from and sell into.
+axes[4].bar(
+    hours,
+    export_ceiling[window] / 1e3,
+    width=1.0,
+    color="tab:red",
+    alpha=0.6,
+    align="edge",
+    label="Unmet demand (sellable headroom)",
+)
+axes[4].bar(
+    hours,
+    -existing_spill[window] / 1e3,
+    width=1.0,
+    color="tab:orange",
+    alpha=0.8,
+    align="edge",
+    label="Spill (chargeable surplus)",
+)
+axes[4].axhline(0.0, color="k", linewidth=0.8)
+axes[4].set_ylabel("Existing plant (MW)")
+axes[4].set_xlabel("Hour of week")
+axes[4].legend(loc="upper right", fontsize=8)
 
 plt.tight_layout()
 plt.savefig("lp_arbitrage_results.png", dpi=150)

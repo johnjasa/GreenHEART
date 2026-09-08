@@ -40,6 +40,8 @@ class GridPerformanceModel(PerformanceModelBaseClass):
 
     Inputs
         interconnection_size (float): Maximum power capacity for grid connection (kW).
+        export_limit_profile (array): Per-timestep ceiling on selling, applied on top of
+            ``interconnection_size`` (kW). Defaults to ``interconnection_size``.
         electricity_in (array): Power flowing into the grid (selling) (kW).
         electricity_command_value (array): Downstream electricity command value (kW).
 
@@ -81,6 +83,16 @@ class GridPerformanceModel(PerformanceModelBaseClass):
             shape=self.n_timesteps,
             units=self.commodity_rate_units,
             desc="Electricity flowing into grid interconnection point (selling to grid)",
+        )
+
+        # Lets an external signal (for example an existing plant's unmet demand) cap
+        # exports per timestep. Defaults to a no-op.
+        self.add_input(
+            "export_limit_profile",
+            val=self.config.interconnection_size,
+            shape=self.n_timesteps,
+            units=self.commodity_rate_units,
+            desc="Per-timestep ceiling on electricity sold to the grid",
         )
 
         # Electricity command value from downstream (for buying from grid)
@@ -130,7 +142,8 @@ class GridPerformanceModel(PerformanceModelBaseClass):
         interconnection_size = inputs["interconnection_size"]
 
         # Selling: electricity flows into grid, limited by interconnection size
-        electricity_sold = np.clip(inputs["electricity_in"], 0, interconnection_size)
+        sell_limit = np.minimum(interconnection_size, inputs["export_limit_profile"])
+        electricity_sold = np.clip(inputs["electricity_in"], 0, sell_limit)
         outputs["electricity_sold"] = electricity_sold
 
         # Buying: electricity flows out of grid to meet command value, limited by interconnection

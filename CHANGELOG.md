@@ -20,7 +20,10 @@
 - Added `LPArbitrageControl`, a system-level controller that solves a rolling-horizon linear program to co-optimize storage, dispatchable technologies, and grid export against a time-varying sale price. [PR TBD](https://github.com/NatLabRockies/H2Integrate/pull/TBD)
   - Added an `export_component` key to the system-level control configuration so the controller can read the sale price and interconnection limit from a downstream export technology.
   - Fixed a divide-by-zero in `DemandComponentBase` that produced a NaN capacity factor when the demand profile is zero, which prevented merchant plants with no on-site load from converging.
-  - Added example 35 `lp_arbitrage`, a merchant solar plus battery plant that arbitrages a synthetic hourly locational marginal price series, valued with `ProFastNPV` at the realized volume-weighted export price and reported with dispatch and economics figures.
+  - Added `export_limit_component` and `surplus_source_component` control parameters so the controller can be limited to an existing plant's unmet demand and spilled production, which isolates the value of an addition to that plant.
+  - Added an `uncontrolled_components` key to the system-level control configuration so a pre-existing plant can be physically connected without the controller dispatching it or counting its output as available supply.
+  - Added an `export_limit_profile` input to `GridPerformanceModel` so a time-varying export ceiling is physically enforced rather than only respected inside the controller.
+  - Added example 35 `lp_arbitrage`, a solar plus battery addition to an existing plant that arbitrages a synthetic hourly locational marginal price series, valued with `ProFastNPV` at the realized volume-weighted export price and reported with dispatch and economics figures.
 
 ## 0.9 [August 10, 2026]
 

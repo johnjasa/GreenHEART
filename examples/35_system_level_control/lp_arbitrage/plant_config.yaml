@@ -1,9 +1,11 @@
 name: plant_config
 description: >
-  Merchant solar plus battery plant with LP-based energy arbitrage against an
-  hourly locational marginal price series. There is no on-site load: the demand
-  component is set to zero so that all production flows through its
-  ``unused_electricity_out`` port to the export grid connection.
+  A solar plus battery addition to an existing solar farm that serves a flat
+  on-site load. The LP values only the addition: it may sell no more than the
+  existing plant leaves unserved, and it may absorb the existing plant's spill.
+  The addition has no on-site load of its own, so its demand component is set to
+  zero and all of its production flows through ``unused_electricity_out`` to the
+  export grid connection.
 sites:
   site:
     latitude: 30.6617
@@ -14,12 +16,17 @@ sites:
         resource_parameters:
           resource_year: 2013
 technology_interconnections:
+  # Existing plant: a solar farm serving a flat on-site load.
+  - [existing_solar, existing_load_demand, electricity, cable]
   # Source bus: solar and grid imports are aggregated into a single stream.
   # Routing the import technology through this combiner is what physically
   # enables grid charging, because the storage model clips charging to the
   # commodity present at its input.
   - [solar, charge_combiner, electricity, cable]
   - [grid_buy, charge_combiner, electricity, cable]
+  # The existing plant's spill is physically available to the battery, so it has
+  # to reach the charge bus for the commanded schedule to be realizable.
+  - [existing_load_demand, charge_combiner, [unused_electricity_out, electricity_in3]]
   # The aggregated source feeds the battery and also flows straight through to
   # the delivery bus. A combiner is the only technology allowed to fan out to
   # both a storage component and a downstream combiner.
@@ -34,6 +41,7 @@ technology_interconnections:
   - [electrical_load_demand, grid_sell, [unused_electricity_out, electricity_in]]
 resource_to_tech_connections:
   - [site.solar_resource, solar, solar_resource_data]
+  - [site.solar_resource, existing_solar, solar_resource_data]
 plant:
   plant_life: 30
   simulation:
@@ -43,10 +51,15 @@ system_level_control:
   control_strategy: LPArbitrageControl
   demand_component: electrical_load_demand
   export_component: grid_sell
+  uncontrolled_components: [existing_solar]
   control_parameters:
     n_control_window_hours: 24
     cost_per_tech:
       grid_buy: buy_price  # marginal cost of an import is the hourly LMP
+    # Value only the addition: sell no more than the existing plant leaves
+    # unserved, and absorb what it spills.
+    export_limit_component: existing_load_demand
+    surplus_source_component: existing_load_demand
     storage_cycle_cost: 0.001  # $/kWh throughput; breaks ties between schedules
     terminal_soc_price_factor: 1.0
     value_of_lost_load: 10.0

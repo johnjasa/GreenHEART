@@ -513,6 +513,10 @@ class H2IntegrateModel:
                   *downstream* of the demand component (they are fed by
                   ``unused_{commodity}_out``) and so are not part of
                   ``tech_to_commodity``. ``None`` when no export component is configured.
+
+        Technologies listed under ``system_level_control["uncontrolled_components"]`` are
+        removed from the upstream set, which lets a pre-existing plant be physically
+        connected without the controller dispatching it or counting its output.
         """
         slc_topology = {}
         technologies = self.technology_config.get("technologies", {})
@@ -574,6 +578,19 @@ class H2IntegrateModel:
         upstream_controllable_techs = {
             tech for tech in upstream_techs if nx.has_path(self.technology_graph, tech, demand_tech)
         }
+
+        # Technologies belonging to a pre-existing plant can be physically wired into
+        # the controlled plant while staying outside the controller's scope.
+        uncontrolled_techs = self.plant_config["system_level_control"].get(
+            "uncontrolled_components", []
+        )
+        if unknown := set(uncontrolled_techs) - set(technologies):
+            msg = (
+                f"``uncontrolled_components`` for the system level controller names "
+                f"{sorted(unknown)}, which are not defined in the tech configuration file."
+            )
+            raise ValueError(msg)
+        upstream_controllable_techs -= set(uncontrolled_techs)
 
         sources_to_commodities = set()
         for source, _, commodities in self.technology_graph.edges(data="commodity"):
@@ -898,6 +915,35 @@ class H2IntegrateModel:
                 self.model.connect(
                     f"{export_tech}.{sell_price_input}",
                     f"system_level_controller.{export_tech}_sell_price",
+                )
+
+        # --- Step 7: Connect optional headroom signals from an existing plant ---
+        # These let a controller value an addition against only what an existing
+        # plant leaves unserved (its unmet demand) or spills (its unused output).
+        control_parameters = plant_slc_config.get("control_parameters", {})
+        headroom_sources = {
+            "export_limit_component": ("unmet_{}_demand_out", "{}_unmet_demand"),
+            "surplus_source_component": ("unused_{}_out", "{}_surplus"),
+        }
+        for config_key, (source_template, target_template) in headroom_sources.items():
+            source_tech = control_parameters.get(config_key, None)
+            if source_tech is None:
+                continue
+            if source_tech not in self.technology_config["technologies"]:
+                raise ValueError(
+                    f"``{config_key}`` for the system level controller names "
+                    f"'{source_tech}', which is not a configured technology."
+                )
+            self.plant.connect(
+                f"{source_tech}.{source_template.format(demand_commodity)}",
+                f"system_level_controller.{target_template.format(source_tech)}",
+            )
+            # The export technology needs the same ceiling, otherwise it physically
+            # sells commodity the controller planned to curtail.
+            if config_key == "export_limit_component" and export_tech is not None:
+                self.plant.connect(
+                    f"{source_tech}.{source_template.format(demand_commodity)}",
+                    f"{export_tech}.export_limit_profile",
                 )
 
     def create_technology_models(self):

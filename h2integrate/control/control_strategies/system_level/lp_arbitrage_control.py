@@ -36,6 +36,15 @@ class LPArbitrageControlConfig(BaseConfig):
             discharge_efficiency``, which prevents the optimizer from emptying
             storage at every window boundary. Set to 0.0 to disable. Defaults
             to 1.0.
+        export_limit_component (str | None): Name of a demand component whose
+            unmet demand caps exports at each timestep, in addition to the
+            export technology's interconnection size. Used to value an addition
+            against only the demand an existing plant leaves unserved. Defaults
+            to None, which applies the interconnection size alone.
+        surplus_source_component (str | None): Name of a demand component whose
+            unused output is made available to the controlled technologies, so
+            an added storage technology can absorb an existing plant's spilled
+            production. Defaults to None.
         solver_name (str): Pyomo solver used to solve each window. Defaults to
             ``"glpk"``.
         solver_options (dict): Additional options passed through to the solver.
@@ -47,6 +56,8 @@ class LPArbitrageControlConfig(BaseConfig):
     value_of_lost_load: float = field(default=10.0, converter=float)
     storage_cycle_cost: float = field(default=0.0, converter=float)
     terminal_soc_price_factor: float = field(default=1.0, converter=float)
+    export_limit_component: str | None = field(default=None)
+    surplus_source_component: str | None = field(default=None)
     solver_name: str = field(default="glpk")
     solver_options: dict = field(default={})
 
@@ -77,7 +88,8 @@ class LPArbitrageControl(SystemLevelControlBase):
     - ``dispatch[d]`` for each dispatchable technology, bounded by its rated
       production.
     - ``export``, the quantity sold through the export technology, bounded by
-      that technology's interconnection size.
+      that technology's interconnection size and, if ``export_limit_component``
+      is set, by that component's unmet demand in the same timestep.
     - ``curtail``, surplus that cannot be exported because the interconnection
       is saturated.
     - ``unmet``, a demand shortfall slack penalized at ``value_of_lost_load``.
@@ -114,6 +126,19 @@ class LPArbitrageControl(SystemLevelControlBase):
     actually route the import technology into the storage technology's
     commodity input.
 
+    **Valuing an addition to an existing plant**
+
+    Setting ``export_limit_component`` and ``surplus_source_component`` to an
+    existing plant's demand component restricts the controlled technologies to
+    that plant's leftovers, which isolates the value of the addition. The
+    demand component guarantees that unmet demand and unused production are
+    never simultaneously nonzero, so the two signals compose cleanly: in a
+    deficit timestep the addition may sell up to the shortfall, and in a
+    surplus timestep the export ceiling is zero, so the spilled production can
+    only be stored or curtailed rather than resold. Note that this holds the
+    existing plant's dispatch fixed, which is a good approximation only while
+    the addition is small enough not to change how that plant would run.
+
     Configuration is read from
     ``plant_config["system_level_control"]["control_parameters"]``. The export
     technology is named by ``plant_config["system_level_control"]["export_component"]``
@@ -138,7 +163,6 @@ class LPArbitrageControl(SystemLevelControlBase):
     values all sales at one price through one interconnection. Plants that sell
     into several markets, or that face separate import and export nodes with
     different prices, need one export variable and price series per sales point.
-
     TODO: Generalize the storage model. See :meth:`_read_storage_parameters` and
     :meth:`_build_lp_model` for the specific assumptions (lossless standby,
     symmetric efficiency split, static sizing, no ramp or minimum-power limits)
@@ -204,6 +228,30 @@ class LPArbitrageControl(SystemLevelControlBase):
 
         self.export_limit = self._read_export_limit()
 
+        # Optional headroom signals from an existing plant, so an addition can be
+        # valued against only what that plant leaves unserved or spills. Unmet
+        # demand and unused production are mutually exclusive at any timestep, so
+        # spilled production can only be stored or curtailed, never resold.
+        self.export_limit_component = self.config.export_limit_component
+        if self.export_limit_component is not None:
+            self.add_input(
+                f"{self.export_limit_component}_unmet_demand",
+                val=self.export_limit,
+                shape=self.n_timesteps,
+                units=self.commodity_rate_units,
+                desc=f"Unmet {self.commodity} demand available for this plant to serve",
+            )
+
+        self.surplus_source_component = self.config.surplus_source_component
+        if self.surplus_source_component is not None:
+            self.add_input(
+                f"{self.surplus_source_component}_surplus",
+                val=0.0,
+                shape=self.n_timesteps,
+                units=self.commodity_rate_units,
+                desc=f"Spilled {self.commodity} available to this plant's technologies",
+            )
+
         # Marginal-cost inputs for dispatchable techs (shared with the
         # cost-aware heuristic controllers).
         self._setup_marginal_costs()
@@ -243,17 +291,18 @@ class LPArbitrageControl(SystemLevelControlBase):
     def _read_export_limit(self):
         """Return the export technology's interconnection size.
 
-        TODO: Generalize beyond a single scalar limit. This assumes one export
-        technology whose capability is one constant number, which fits a grid
-        interconnection agreement. A pipeline, a truck fleet, or a contracted
-        offtake schedule would need a time-varying limit, and a plant with more
-        than one sales point would need one limit per point.
+        This is the static ceiling on exports. A per-timestep ceiling can be
+        layered on top of it with ``export_limit_component``.
 
         TODO: Generalize the parameter name. ``interconnection_size`` is
         electricity-specific. Storage or transport technologies for other
         commodities name their capability differently, so this lookup should be
         driven by the technology's declared capacity parameter rather than a
         hard-coded key.
+
+        TODO: Generalize to more than one sales point. A plant selling into
+        several markets needs one export variable, price series, and limit per
+        point.
 
         Returns:
             float: Maximum export rate in ``commodity_rate_units``.
@@ -430,6 +479,7 @@ class LPArbitrageControl(SystemLevelControlBase):
         model.rated = pyo.Param(model.D, initialize=0.0, mutable=True)
         model.soc_init = pyo.Param(model.S, initialize=0.0, mutable=True)
         model.terminal_price = pyo.Param(model.S, initialize=0.0, mutable=True)
+        model.export_limit = pyo.Param(model.T, initialize=self.export_limit, mutable=True)
 
         # --- Decision variables -------------------------------------------
         def _charge_bounds(_, tech_name, __):
@@ -449,7 +499,9 @@ class LPArbitrageControl(SystemLevelControlBase):
         model.discharge = pyo.Var(model.S, model.T, bounds=_discharge_bounds)
         model.soc = pyo.Var(model.S, model.T, bounds=_soc_bounds)
         model.dispatch = pyo.Var(model.D, model.T, domain=pyo.NonNegativeReals)
-        model.export = pyo.Var(model.T, bounds=(0.0, self.export_limit))
+        # Pyomo re-reads a mutable Param in a bound on every solve, so the
+        # export ceiling can vary by timestep without rebuilding the model.
+        model.export = pyo.Var(model.T, bounds=lambda m, t: (0.0, m.export_limit[t]))
         model.curtail = pyo.Var(model.T, domain=pyo.NonNegativeReals)
         model.unmet = pyo.Var(model.T, domain=pyo.NonNegativeReals)
 
@@ -633,6 +685,20 @@ class LPArbitrageControl(SystemLevelControlBase):
         for tech_name in self.lp_must_run_techs:
             must_run += np.asarray(inputs[f"{tech_name}_{commodity}_out"], dtype=float)
 
+        # Spilled production from an existing plant behaves like must-run supply.
+        # It cannot be resold, because the export ceiling below is zero in exactly
+        # the timesteps where spillage is nonzero, so it is stored or curtailed.
+        if self.surplus_source_component is not None:
+            must_run += np.asarray(inputs[f"{self.surplus_source_component}_surplus"], dtype=float)
+
+        if self.export_limit_component is not None:
+            export_ceiling = np.minimum(
+                self.export_limit,
+                np.asarray(inputs[f"{self.export_limit_component}_unmet_demand"], dtype=float),
+            )
+        else:
+            export_ceiling = np.full(n_timesteps, self.export_limit)
+
         # Flexible techs are commanded at rated production; their performance
         # models are resource-limited, so this is a pass-through rather than a
         # dispatch decision.
@@ -672,7 +738,7 @@ class LPArbitrageControl(SystemLevelControlBase):
         # resource-driven rather than set-point-driven, the inputs stop changing
         # after the first pass. Re-solving every window on every iteration would
         # repeat identical work.
-        cache_key = (must_run, demand, sell_price, marginal_cost_stack, rated)
+        cache_key = (must_run, demand, sell_price, marginal_cost_stack, rated, export_ceiling)
         if self._cached_key is not None and all(
             np.array_equal(cached, current)
             for cached, current in zip(self._cached_key, cache_key, strict=True)
@@ -711,6 +777,7 @@ class LPArbitrageControl(SystemLevelControlBase):
                 model.must_run[t] = float(must_run[idx])
                 model.demand[t] = float(demand[idx])
                 model.sell_price[t] = float(sell_price[idx])
+                model.export_limit[t] = float(export_ceiling[idx])
                 for tech_name in self.lp_dispatchable_techs:
                     model.marginal_cost[tech_name, t] = float(marginal_costs[tech_name][idx])
 

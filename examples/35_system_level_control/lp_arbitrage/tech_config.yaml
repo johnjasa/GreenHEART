@@ -1,8 +1,8 @@
 name: technology_config
 description: >
-  Merchant solar plus battery plant with separate grid connections for imports
-  and exports. Both grid price series are overridden with an hourly LMP profile
-  in the run script.
+  A solar plus battery addition with separate grid connections for imports and
+  exports, alongside an existing solar farm and its on-site load. Both grid price
+  series are overridden with an hourly LMP profile in the run script.
 technologies:
   solar:
     performance_model:
@@ -86,7 +86,7 @@ technologies:
       performance_parameters:
         commodity: electricity
         commodity_rate_units: kW
-        in_streams: 2  # solar + grid imports
+        in_streams: 3  # new solar + grid imports + existing plant's spill
   out_combiner:
     performance_model:
       model: GenericCombinerPerformanceModel
@@ -103,3 +103,36 @@ technologies:
         commodity: electricity
         commodity_rate_units: kW
         demand_profile: 0.  # merchant plant: no on-site load, everything is exported
+  # --- Existing plant, listed under uncontrolled_components so the controller
+  # --- neither dispatches it nor counts its output as available supply.
+  existing_solar:
+    performance_model:
+      model: PYSAMSolarPlantPerformanceModel
+    cost_model:
+      model: ATBUtilityPVCostModel
+    model_inputs:
+      performance_parameters:
+        pv_capacity_kWdc: 150000  # 150 MWdc
+        dc_ac_ratio: 1.3
+        create_model_from: default
+        config_name: PVWattsSingleOwner
+        tilt_angle_func: lat-func
+        pysam_options:
+          SystemDesign:
+            inv_eff: 96.0
+            module_type: 0
+            losses: 14.08
+          Lifetime:
+            dc_degradation: [0]
+      cost_parameters:
+        capex_per_kWac: 900
+        opex_per_kWac_per_year: 15
+        cost_year: 2024
+  existing_load_demand:
+    performance_model:
+      model: GenericDemandComponent
+    model_inputs:
+      performance_parameters:
+        commodity: electricity
+        commodity_rate_units: kW
+        demand_profile: 60000.  # 60 MW flat load
