@@ -61,7 +61,6 @@ system_level_control:
     export_limit_component: existing_load_demand
     surplus_source_component: existing_load_demand
     storage_cycle_cost: 0.001  # $/kWh throughput; breaks ties between schedules
-    terminal_soc_price_factor: 1.0
     value_of_lost_load: 10.0
     solver_name: glpk
   solver_options:

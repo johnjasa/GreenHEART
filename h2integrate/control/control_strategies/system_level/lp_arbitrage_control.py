@@ -18,6 +18,15 @@ class LPArbitrageControlConfig(BaseConfig):
         n_control_window_hours (int): Length of each rolling optimization window
             in hours. The state of charge at the end of one window becomes the
             initial state of charge of the next. Defaults to 24.
+        n_commit_window_hours (int | None): Number of hours kept from each solved
+            window before the horizon advances. Every solve looks ahead a full
+            window but only the leading ``n_commit_window_hours`` are written
+            out, so the end-of-horizon boundary never reaches the committed
+            schedule. Shortening it costs ``n_control_window_hours /
+            n_commit_window_hours`` times more solves. Setting it equal to
+            ``n_control_window_hours`` recovers non-overlapping blocks, which
+            leaves storage with no reason to carry a charge across a boundary.
+            Defaults to None, which uses a quarter of the control window.
         cost_per_tech (dict): Marginal-cost specification for each dispatchable
             technology, using the same syntax as ``CostMinimizationControl``.
             Each entry may be a numeric value, ``"buy_price"``, ``"VarOpEx"``,
@@ -30,12 +39,6 @@ class LPArbitrageControlConfig(BaseConfig):
             plus discharge), in ``USD/(commodity_rate_unit*h)``. Represents
             degradation and breaks ties between equivalent dispatch schedules.
             Defaults to 0.0.
-        terminal_soc_price_factor (float): Scaling applied to the end-of-window
-            state-of-charge valuation. The stored commodity remaining at the end
-            of a window is valued at ``factor * mean_window_price *
-            discharge_efficiency``, which prevents the optimizer from emptying
-            storage at every window boundary. Set to 0.0 to disable. Defaults
-            to 1.0.
         export_limit_component (str | None): Name of a demand component whose
             unmet demand caps exports at each timestep, in addition to the
             export technology's interconnection size. Used to value an addition
@@ -52,10 +55,10 @@ class LPArbitrageControlConfig(BaseConfig):
     """
 
     n_control_window_hours: int = field(default=24, converter=int)
+    n_commit_window_hours: int | None = field(default=None)
     cost_per_tech: dict = field(default={})
     value_of_lost_load: float = field(default=10.0, converter=float)
     storage_cycle_cost: float = field(default=0.0, converter=float)
-    terminal_soc_price_factor: float = field(default=1.0, converter=float)
     export_limit_component: str | None = field(default=None)
     surplus_source_component: str | None = field(default=None)
     solver_name: str = field(default="glpk")
@@ -102,7 +105,6 @@ class LPArbitrageControl(SystemLevelControlBase):
                     - sum_d marginal_cost[d, t] * dispatch[d, t]
                     - value_of_lost_load * unmet[t]
                     - storage_cycle_cost * sum_s (charge[s, t] + discharge[s, t]) )
-        + sum_s terminal_price[s] * soc[s, last]
 
     **Constraints**:
 
@@ -165,9 +167,8 @@ class LPArbitrageControl(SystemLevelControlBase):
     different prices, need one export variable and price series per sales point.
     TODO: Generalize the storage model. See :meth:`_read_storage_parameters` and
     :meth:`_build_lp_model` for the specific assumptions (lossless standby,
-    symmetric efficiency split, static sizing, no ramp or minimum-power limits)
-    that hold for a lithium-ion battery but not for hydrogen, thermal, or
-    pumped-hydro storage.
+    symmetric efficiency split, no ramp or minimum-power limits) that hold for a
+    lithium-ion battery but not for hydrogen, thermal, or pumped-hydro storage.
 
     TODO: Generalize the dispatchable model. Every dispatchable technology is
     assumed to be continuously adjustable between zero and rated production at
@@ -256,14 +257,37 @@ class LPArbitrageControl(SystemLevelControlBase):
         # cost-aware heuristic controllers).
         self._setup_marginal_costs()
 
-        # Storage design parameters are read from the technology config rather
-        # than from connected inputs. Connected values are zero until the
-        # storage model has executed once, which would make the first solver
-        # iteration degenerate.
+        # Storage efficiencies and state-of-charge fractions come from the
+        # technology config; sizing comes from connected inputs below.
         self.storage_params = self._read_storage_parameters()
 
         # Only technologies producing the controlled commodity participate.
         self.lp_storage_techs = list(self.storage_params.keys())
+
+        # Sizing is taken from the storage models' own inputs so that a design
+        # variable or parameter sweep moves the plant and the controller together.
+        for tech_name in self.lp_storage_techs:
+            params = self.storage_params[tech_name]
+            self.add_input(
+                f"{tech_name}_storage_capacity",
+                val=params["capacity"],
+                units=f"({self.commodity_rate_units})*h",
+                desc=f"Usable capacity of {tech_name}",
+            )
+            self.add_input(
+                f"{tech_name}_max_charge_rate",
+                val=params["max_charge_rate"],
+                units=self.commodity_rate_units,
+                desc=f"Maximum charge rate of {tech_name}",
+            )
+            if params["has_discharge_rate_input"]:
+                self.add_input(
+                    f"{tech_name}_max_discharge_rate",
+                    val=params["max_discharge_rate"],
+                    units=self.commodity_rate_units,
+                    desc=f"Maximum discharge rate of {tech_name}",
+                )
+
         self.lp_dispatchable_techs = [
             tech
             for tech in self.dispatchable_techs
@@ -276,6 +300,7 @@ class LPArbitrageControl(SystemLevelControlBase):
         ]
 
         self.window_len = self._resolve_window_length()
+        self.commit_len = self._resolve_commit_length()
 
         # Built lazily on the first compute() so setup stays cheap and the
         # solver is only required when the model is actually run.
@@ -326,7 +351,15 @@ class LPArbitrageControl(SystemLevelControlBase):
         return float(all_params["interconnection_size"])
 
     def _read_storage_parameters(self):
-        """Read storage sizing, efficiency, and state-of-charge bounds from config.
+        """Read storage efficiencies, state-of-charge fractions, and default sizing from config.
+
+        Capacity and rate limits returned here are only defaults for the
+        corresponding controller inputs. The values actually used to bound the
+        linear program are read from those inputs in :meth:`compute`, which are
+        connected to the storage models' own sizing inputs, so a design variable
+        or a parameter sweep moves the plant and the controller together.
+        Efficiencies and state-of-charge fractions are still config-only because
+        the storage models do not expose them as inputs.
 
         TODO: Generalize the efficiency split. When only ``round_trip_efficiency``
         is given it is divided evenly between charging and discharging via a
@@ -336,16 +369,6 @@ class LPArbitrageControl(SystemLevelControlBase):
         direction, will be misrepresented. Prefer explicit ``charge_efficiency``
         and ``discharge_efficiency``, and allow them to vary with state of
         charge or power level.
-
-        TODO: Generalize static sizing. Capacity and power limits are read from
-        the technology configuration rather than from connected inputs, because
-        connected values are still zero on the first solver iteration. This
-        breaks if storage is sized by a design variable or an upstream sizing
-        model. Reading the connected inputs once they are populated, and
-        rebuilding the variable bounds when they change, would remove the
-        restriction. NOTE: this may no longer be relevant; revisit if we can
-        reasonably use the connected variables directly here instead of reading
-        from the config file.
 
         TODO: Capture the state-dependent parameters other storage technologies
         need. There is no self-discharge or boil-off rate, no standby power, no
@@ -389,6 +412,9 @@ class LPArbitrageControl(SystemLevelControlBase):
                 "capacity": float(params["max_capacity"]),
                 "max_charge_rate": max_charge_rate,
                 "max_discharge_rate": float(max_discharge_rate),
+                # The storage model only declares a discharge-rate input when
+                # the two rates are allowed to differ.
+                "has_discharge_rate_input": not params.get("charge_equals_discharge", True),
                 "charge_efficiency": float(charge_efficiency),
                 "discharge_efficiency": float(discharge_efficiency),
                 "min_soc_fraction": float(params.get("min_soc_fraction", 0.0)),
@@ -411,6 +437,31 @@ class LPArbitrageControl(SystemLevelControlBase):
                 f"shorter than a single timestep ({self.dt_h} h)."
             )
         return min(window_len, self.n_timesteps)
+
+    def _resolve_commit_length(self):
+        """Convert the configured commit length in hours to a number of timesteps.
+
+        Returns:
+            int: Number of timesteps kept from each solved window. Defaults to a
+            quarter of the window, so three quarters of every solve is lookahead
+            that informs the committed block and is then discarded.
+        """
+        if self.config.n_commit_window_hours is None:
+            return max(1, round(self.window_len / 4))
+
+        commit_len = round(self.config.n_commit_window_hours / self.dt_h)
+        if commit_len < 1:
+            raise ValueError(
+                f"n_commit_window_hours ({self.config.n_commit_window_hours}) is "
+                f"shorter than a single timestep ({self.dt_h} h)."
+            )
+        if commit_len > self.window_len:
+            raise ValueError(
+                f"n_commit_window_hours ({self.config.n_commit_window_hours}) cannot "
+                f"exceed n_control_window_hours ({self.config.n_control_window_hours}); "
+                "the controller cannot commit more timesteps than it optimizes over."
+            )
+        return commit_len
 
     # ------------------------------------------------------------------
     # Linear program construction
@@ -480,22 +531,46 @@ class LPArbitrageControl(SystemLevelControlBase):
         model.marginal_cost = pyo.Param(model.D, model.T, initialize=0.0, mutable=True)
         model.rated = pyo.Param(model.D, initialize=0.0, mutable=True)
         model.soc_init = pyo.Param(model.S, initialize=0.0, mutable=True)
-        model.terminal_price = pyo.Param(model.S, initialize=0.0, mutable=True)
         model.export_limit = pyo.Param(model.T, initialize=self.export_limit, mutable=True)
 
+        # Storage sizing is mutable so a design variable or sweep changes the
+        # variable bounds without rebuilding the model.
+        model.max_charge = pyo.Param(
+            model.S,
+            initialize={s: storage_params[s]["max_charge_rate"] for s in self.lp_storage_techs},
+            mutable=True,
+        )
+        model.max_discharge = pyo.Param(
+            model.S,
+            initialize={s: storage_params[s]["max_discharge_rate"] for s in self.lp_storage_techs},
+            mutable=True,
+        )
+        model.soc_min = pyo.Param(
+            model.S,
+            initialize={
+                s: storage_params[s]["min_soc_fraction"] * storage_params[s]["capacity"]
+                for s in self.lp_storage_techs
+            },
+            mutable=True,
+        )
+        model.soc_max = pyo.Param(
+            model.S,
+            initialize={
+                s: storage_params[s]["max_soc_fraction"] * storage_params[s]["capacity"]
+                for s in self.lp_storage_techs
+            },
+            mutable=True,
+        )
+
         # --- Decision variables -------------------------------------------
-        def _charge_bounds(_, tech_name, __):
-            return 0.0, storage_params[tech_name]["max_charge_rate"]
+        def _charge_bounds(m, tech_name, _):
+            return 0.0, m.max_charge[tech_name]
 
-        def _discharge_bounds(_, tech_name, __):
-            return 0.0, storage_params[tech_name]["max_discharge_rate"]
+        def _discharge_bounds(m, tech_name, _):
+            return 0.0, m.max_discharge[tech_name]
 
-        def _soc_bounds(_, tech_name, __):
-            params = storage_params[tech_name]
-            return (
-                params["min_soc_fraction"] * params["capacity"],
-                params["max_soc_fraction"] * params["capacity"],
-            )
+        def _soc_bounds(m, tech_name, _):
+            return m.soc_min[tech_name], m.soc_max[tech_name]
 
         model.charge = pyo.Var(model.S, model.T, bounds=_charge_bounds)
         model.discharge = pyo.Var(model.S, model.T, bounds=_discharge_bounds)
@@ -549,7 +624,7 @@ class LPArbitrageControl(SystemLevelControlBase):
 
         # --- Objective -----------------------------------------------------
         def _objective_rule(m):
-            """Return window profit, plus the value of the commodity left in storage."""
+            """Return the profit earned over the window."""
             revenue = sum(m.sell_price[t] * m.export[t] for t in m.T)
             generation_cost = sum(
                 m.marginal_cost[d, t] * m.dispatch[d, t] for d in m.D for t in m.T
@@ -558,8 +633,7 @@ class LPArbitrageControl(SystemLevelControlBase):
             cycle_cost = self.config.storage_cycle_cost * sum(
                 m.charge[s, t] + m.discharge[s, t] for s in m.S for t in m.T
             )
-            terminal_value = sum(m.terminal_price[s] * m.soc[s, window_len - 1] for s in m.S)
-            return dt_h * (revenue - generation_cost - unmet_cost - cycle_cost) + terminal_value
+            return dt_h * (revenue - generation_cost - unmet_cost - cycle_cost)
 
         model.objective = pyo.Objective(rule=_objective_rule, sense=pyo.maximize)
 
@@ -660,14 +734,6 @@ class LPArbitrageControl(SystemLevelControlBase):
         resource so the optimizer curtails it explicitly instead of routing the
         surplus through the ``curtail`` slack.
 
-        TODO: Generalize the terminal state-of-charge valuation. Energy left in
-        storage at a window boundary is priced at the mean price over that
-        window scaled by discharge efficiency. This is a heuristic that works
-        when the price series is roughly cyclic over the window, which holds for
-        a daily or weekly electricity market. Storage that cycles seasonally, or
-        that serves a commodity with a trending price, needs a value function
-        derived from a longer horizon.
-
         TODO: Revisit the result cache if any technology becomes truly
         set-point-responsive. The cache assumes the schedule is a pure function
         of the recorded inputs and that they stop changing once the fixed-point
@@ -682,6 +748,7 @@ class LPArbitrageControl(SystemLevelControlBase):
         commodity = self.commodity
         n_timesteps = self.n_timesteps
         window_len = self.window_len
+        commit_len = self.commit_len
 
         demand = np.asarray(inputs[self.demand_input_name], dtype=float)
         sell_price = self._broadcast_price(inputs[f"{self.export_tech}_sell_price"])
@@ -739,12 +806,39 @@ class LPArbitrageControl(SystemLevelControlBase):
             else np.zeros((0, n_timesteps))
         )
 
+        # Storage sizing comes from the storage models' own inputs, so sweeping
+        # a capacity or rate re-solves rather than reusing a stale schedule.
+        storage_sizing = {}
+        for tech_name in self.lp_storage_techs:
+            max_charge_rate = float(np.asarray(inputs[f"{tech_name}_max_charge_rate"]).item())
+            discharge_name = f"{tech_name}_max_discharge_rate"
+            storage_sizing[tech_name] = (
+                float(np.asarray(inputs[f"{tech_name}_storage_capacity"]).item()),
+                max_charge_rate,
+                float(np.asarray(inputs[discharge_name]).item())
+                if discharge_name in inputs
+                else max_charge_rate,
+            )
+        storage_sizing_stack = (
+            np.array([storage_sizing[tech_name] for tech_name in self.lp_storage_techs])
+            if self.lp_storage_techs
+            else np.zeros((0, 3))
+        )
+
         # The schedule is a pure function of these arrays. This controller sits
         # in a fixed-point loop, and because flexible technologies are
         # resource-driven rather than set-point-driven, the inputs stop changing
         # after the first pass. Re-solving every window on every iteration would
         # repeat identical work.
-        cache_key = (must_run, demand, sell_price, marginal_cost_stack, rated, export_ceiling)
+        cache_key = (
+            must_run,
+            demand,
+            sell_price,
+            marginal_cost_stack,
+            rated,
+            export_ceiling,
+            storage_sizing_stack,
+        )
         if self._cached_key is not None and all(
             np.array_equal(cached, current)
             for cached, current in zip(self._cached_key, cache_key, strict=True)
@@ -761,22 +855,28 @@ class LPArbitrageControl(SystemLevelControlBase):
         for tech_name, rated_value in zip(self.lp_dispatchable_techs, rated, strict=True):
             model.rated[tech_name] = float(rated_value)
 
+        for tech_name in self.lp_storage_techs:
+            capacity, max_charge_rate, max_discharge_rate = storage_sizing[tech_name]
+            params = self.storage_params[tech_name]
+            model.max_charge[tech_name] = max_charge_rate
+            model.max_discharge[tech_name] = max_discharge_rate
+            model.soc_min[tech_name] = params["min_soc_fraction"] * capacity
+            model.soc_max[tech_name] = params["max_soc_fraction"] * capacity
+
         soc_state = {
-            tech_name: params["init_soc_fraction"] * params["capacity"]
-            for tech_name, params in self.storage_params.items()
+            tech_name: self.storage_params[tech_name]["init_soc_fraction"]
+            * storage_sizing[tech_name][0]
+            for tech_name in self.lp_storage_techs
         }
 
-        for start in range(0, n_timesteps, window_len):
-            end = min(start + window_len, n_timesteps)
-            actual_len = end - start
+        for start in range(0, n_timesteps, commit_len):
+            commit_end = min(start + commit_len, n_timesteps)
+            committed_len = commit_end - start
 
-            # A trailing partial window is padded by holding the final value so
-            # the fixed-size Pyomo model can be reused; only the real timesteps
-            # are written back out.
-            window_index = np.arange(start, start + window_len)
-            window_index = np.clip(window_index, start, end - 1)
-
-            window_price = sell_price[window_index]
+            # The lookahead runs past the committed block and is padded by holding
+            # the final value, so the fixed-size Pyomo model can be reused near the
+            # end of the simulation.
+            window_index = np.clip(np.arange(start, start + window_len), start, n_timesteps - 1)
 
             for t in range(window_len):
                 idx = window_index[t]
@@ -787,33 +887,29 @@ class LPArbitrageControl(SystemLevelControlBase):
                 for tech_name in self.lp_dispatchable_techs:
                     model.marginal_cost[tech_name, t] = float(marginal_costs[tech_name][idx])
 
-            mean_window_price = float(window_price.mean())
-            for tech_name, params in self.storage_params.items():
+            for tech_name in self.lp_storage_techs:
                 model.soc_init[tech_name] = float(soc_state[tech_name])
-                model.terminal_price[tech_name] = (
-                    self.config.terminal_soc_price_factor
-                    * mean_window_price
-                    * params["discharge_efficiency"]
-                )
 
             self._solve_window(model, start)
 
+            # Only the committed prefix of the solved window is kept; the rest of
+            # the horizon exists to inform it and is discarded.
             for tech_name in self.lp_storage_techs:
                 schedule = np.array(
                     [
                         pyo.value(model.discharge[tech_name, t])
                         - pyo.value(model.charge[tech_name, t])
-                        for t in range(actual_len)
+                        for t in range(committed_len)
                     ]
                 )
-                outputs[f"{tech_name}_{commodity}_set_point"][start:end] = schedule
-                soc_state[tech_name] = pyo.value(model.soc[tech_name, actual_len - 1])
+                outputs[f"{tech_name}_{commodity}_set_point"][start:commit_end] = schedule
+                soc_state[tech_name] = pyo.value(model.soc[tech_name, committed_len - 1])
 
             for tech_name in self.lp_dispatchable_techs:
                 schedule = np.array(
-                    [pyo.value(model.dispatch[tech_name, t]) for t in range(actual_len)]
+                    [pyo.value(model.dispatch[tech_name, t]) for t in range(committed_len)]
                 )
-                outputs[f"{tech_name}_{commodity}_set_point"][start:end] = schedule
+                outputs[f"{tech_name}_{commodity}_set_point"][start:commit_end] = schedule
 
         self._cached_key = tuple(np.array(item, copy=True) for item in cache_key)
         self._cached_set_points = {

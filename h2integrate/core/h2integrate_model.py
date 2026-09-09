@@ -6,7 +6,7 @@ import numpy as np
 import networkx as nx
 import openmdao.api as om
 
-from h2integrate.core.utilities import create_xdsm_from_config
+from h2integrate.core.utilities import merge_shared_inputs, create_xdsm_from_config
 from h2integrate.core.dict_utils import check_inputs
 from h2integrate.core.file_utils import get_path, find_file, load_yaml
 from h2integrate.core.supported_models import (
@@ -832,6 +832,23 @@ class H2IntegrateModel:
                     f"{tech_name}.storage_duration",
                     f"system_level_controller.{tech_name}_{commodity}_storage_duration",
                 )
+
+                if strategy_name == "LPArbitrageControl":
+                    # Input-to-input connections (see Step 4) so one set_val on the
+                    # storage tech resizes both the plant and the controller's
+                    # optimization bounds, which makes sizing sweeps consistent.
+                    storage_params = merge_shared_inputs(
+                        self.technology_config["technologies"][tech_name]["model_inputs"],
+                        "performance",
+                    )
+                    sizing_inputs = ["storage_capacity", "max_charge_rate"]
+                    if not storage_params.get("charge_equals_discharge", True):
+                        sizing_inputs.append("max_discharge_rate")
+                    for sizing_input in sizing_inputs:
+                        self.model.connect(
+                            f"{tech_name}.{sizing_input}",
+                            f"system_level_controller.{tech_name}_{sizing_input}",
+                        )
 
             # Every controlled tech group exposes a ``{commodity}_set_point``
             # input (provided by either a user-defined control_strategy or an

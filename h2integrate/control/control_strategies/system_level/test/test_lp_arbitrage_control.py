@@ -32,7 +32,6 @@ def _fill_window(
     marginal_cost=0.02,
     rated=50_000.0,
     soc_init=None,
-    terminal_price=0.0,
     export_limit=None,
 ):
     """Populate the mutable parameters of a built LP window model."""
@@ -57,7 +56,6 @@ def _fill_window(
         lp.soc_init[s] = (
             params["min_soc_fraction"] * params["capacity"] if soc_init is None else soc_init
         )
-        lp.terminal_price[s] = terminal_price
 
 
 def _series(var, index, window_len):
@@ -87,7 +85,7 @@ def test_lp_arbitrage_setup(subtests, temp_copy_of_example):
     with subtests.test("Sell price input is added"):
         assert "grid_sell_sell_price" in controller._var_rel_names["input"]
 
-    with subtests.test("Storage sizing read from tech config, not connected inputs"):
+    with subtests.test("Default storage sizing comes from the tech config"):
         params = controller.storage_params["battery"]
         assert params["capacity"] == pytest.approx(200_000.0)
         assert params["max_charge_rate"] == pytest.approx(50_000.0)
@@ -279,6 +277,88 @@ def test_lp_arbitrage_requires_export_component(temp_copy_of_example):
     model = H2IntegrateModel(temp_copy_of_example / "solar_battery_arbitrage.yaml")
     with pytest.raises(ValueError, match="requires an export technology"):
         model.setup()
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("example_folder,resource_example_folder", [(EXAMPLE, None)])
+def test_lp_arbitrage_commit_window(subtests, temp_copy_of_example):
+    """``n_commit_window_hours`` decouples the committed block from the lookahead."""
+    config_path = temp_copy_of_example / "plant_config.yaml"
+    text = config_path.read_text()
+
+    with subtests.test("Commit length defaults to a quarter of the window"):
+        controller = _make_controller(temp_copy_of_example)
+        assert controller.window_len == 24
+        assert controller.commit_len == 6
+
+    with subtests.test("A shorter commit length is honored"):
+        config_path.write_text(
+            text.replace(
+                "    n_control_window_hours: 24\n",
+                "    n_control_window_hours: 24\n    n_commit_window_hours: 4\n",
+            )
+        )
+        controller = _make_controller(temp_copy_of_example)
+        assert controller.window_len == 24
+        assert controller.commit_len == 4
+
+    with subtests.test("Committing more than the lookahead is rejected"):
+        config_path.write_text(
+            text.replace(
+                "    n_control_window_hours: 24\n",
+                "    n_control_window_hours: 24\n    n_commit_window_hours: 48\n",
+            )
+        )
+        model = H2IntegrateModel(temp_copy_of_example / "solar_battery_arbitrage.yaml")
+        with pytest.raises(ValueError, match="cannot commit more timesteps"):
+            model.setup()
+
+
+@requires_glpk
+@pytest.mark.unit
+@pytest.mark.parametrize("example_folder,resource_example_folder", [(EXAMPLE, None)])
+def test_lp_arbitrage_storage_sizing_from_inputs(subtests, temp_copy_of_example):
+    """Storage sizing is taken from the storage model's inputs so sweeps stay consistent."""
+    model = H2IntegrateModel(temp_copy_of_example / "solar_battery_arbitrage.yaml")
+    model.setup()
+    model.prob.final_setup()
+    controller = model.prob.model.plant.system_level_controller
+
+    with subtests.test("Sizing inputs are declared and connected"):
+        assert "battery_storage_capacity" in controller._var_rel_names["input"]
+        assert "battery_max_charge_rate" in controller._var_rel_names["input"]
+        # Charge and discharge rates are equal here, so the storage model
+        # declares no discharge-rate input and neither does the controller.
+        assert "battery_max_discharge_rate" not in controller._var_rel_names["input"]
+
+    with subtests.test("Resizing the battery moves the controller with it"):
+        model.prob.set_val("plant.battery.storage_capacity", 400_000.0, units="kW*h")
+        model.prob.set_val("plant.battery.max_charge_rate", 10_000.0, units="kW")
+        model.prob.final_setup()
+        capacity = model.prob.get_val(
+            "plant.system_level_controller.battery_storage_capacity", units="kW*h"
+        ).item()
+        charge_rate = model.prob.get_val(
+            "plant.system_level_controller.battery_max_charge_rate", units="kW"
+        ).item()
+        assert capacity == pytest.approx(400_000.0)
+        assert charge_rate == pytest.approx(10_000.0)
+
+    with subtests.test("The linear program is bounded by the swept sizing"):
+        lp = controller._build_lp_model()
+        lp.max_charge["battery"] = charge_rate
+        lp.soc_max["battery"] = controller.storage_params["battery"]["max_soc_fraction"] * capacity
+        # Cheap first half, expensive second half, so charging to the rate limit pays.
+        hours = np.arange(controller.window_len)
+        _fill_window(
+            lp,
+            controller,
+            sell_price=np.where(hours < controller.window_len // 2, 0.01, 0.10),
+            must_run=20_000.0,
+        )
+        controller._solve_window(lp, 0)
+        charge = _series(lp.charge, "battery", controller.window_len)
+        assert charge.max() == pytest.approx(10_000.0)
 
 
 @requires_glpk
