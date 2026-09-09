@@ -1,4 +1,33 @@
 name: driver_config
-description: LP-based energy arbitrage for a merchant solar plus battery plant
+description: >-
+  Sweep the energy capacity of a merchant battery added to an existing solar
+  plant and record the net present value of each capacity.
 general:
   folder_output: outputs
+  create_om_reports: false
+driver:
+  parameter_sweep:
+    flag: true
+    # Evenly spaced capacities across the design variable bounds below, so
+    # 50, 150, 250, 350, 450 MWh. Each case costs a full year of rolling LP solves.
+    generator: fullfact
+    levels: 5
+    run_parallel: false
+    debug_print: true
+design_variables:
+  battery:
+    # The power rating stays at whatever tech_config.yaml sets, so the sweep is
+    # over hours of storage behind a fixed inverter.
+    storage_capacity:
+      flag: true
+      lower: 50000.0
+      upper: 450000.0
+      units: kW*h
+objective:
+  name: finance_subgroup_electricity.NPV_electricity
+recorder:
+  flag: true
+  file: battery_sizing_sweep.sql
+  overwrite_recorder: true
+  includes: ['*']
+  excludes: ['*resource_data', '*_price', '*_profile']

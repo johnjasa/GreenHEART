@@ -1,32 +1,10 @@
 name: technology_config
 description: >
-  A solar plus battery addition with separate grid connections for imports and
-  exports, alongside an existing solar farm and its on-site load. Both grid price
+  A battery added to an existing solar farm, with separate grid connections for
+  imports and exports. The battery is the only new generating asset; the
+  existing solar farm and its on-site load are pre-existing. Both grid price
   series are overridden with an hourly LMP profile in the run script.
 technologies:
-  solar:
-    performance_model:
-      model: PYSAMSolarPlantPerformanceModel
-    cost_model:
-      model: ATBUtilityPVCostModel
-    model_inputs:
-      performance_parameters:
-        pv_capacity_kWdc: 100000  # 100 MWdc
-        dc_ac_ratio: 1.3
-        create_model_from: default
-        config_name: PVWattsSingleOwner
-        tilt_angle_func: lat-func
-        pysam_options:
-          SystemDesign:
-            inv_eff: 96.0
-            module_type: 0
-            losses: 14.08
-          Lifetime:
-            dc_degradation: [0]
-      cost_parameters:
-        capex_per_kWac: 900
-        opex_per_kWac_per_year: 15
-        cost_year: 2024
   battery:
     performance_model:
       model: StoragePerformanceModel
@@ -86,7 +64,7 @@ technologies:
       performance_parameters:
         commodity: electricity
         commodity_rate_units: kW
-        in_streams: 3  # new solar + grid imports + existing plant's spill
+        in_streams: 2  # grid imports + the existing plant's spill
   out_combiner:
     performance_model:
       model: GenericCombinerPerformanceModel

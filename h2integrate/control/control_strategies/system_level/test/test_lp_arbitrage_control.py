@@ -80,7 +80,7 @@ def test_lp_arbitrage_setup(subtests, temp_copy_of_example):
     with subtests.test("Technology classification"):
         assert controller.lp_storage_techs == ["battery"]
         assert controller.lp_dispatchable_techs == ["grid_buy"]
-        assert controller.lp_must_run_techs == ["solar"]
+        assert controller.lp_must_run_techs == []
 
     with subtests.test("Sell price input is added"):
         assert "grid_sell_sell_price" in controller._var_rel_names["input"]
@@ -375,7 +375,9 @@ def test_lp_arbitrage_example(subtests, temp_copy_of_example):
     model.prob.set_val("grid_sell.electricity_sell_price", price, units="USD/(kW*h)")
     model.prob.set_val("grid_buy.electricity_buy_price", price + 0.004, units="USD/(kW*h)")
 
-    model.run()
+    # A single evaluation, not the example's battery sizing sweep. This
+    # test is about whether the dispatch the controller plans is realizable.
+    model.prob.run_model()
 
     get = model.prob.get_val
     commanded = get("system_level_controller.battery_electricity_set_point", units="kW")
@@ -383,7 +385,6 @@ def test_lp_arbitrage_example(subtests, temp_copy_of_example):
     charge = -get("battery.storage_electricity_charge", units="kW")
     discharge = get("battery.storage_electricity_discharge", units="kW")
     soc = get("battery.SOC", units="percent")
-    solar = get("solar.electricity_out", units="kW")
     imported = get("grid_buy.electricity_out", units="kW")
     exported = get("grid_sell.electricity_sold", units="kW")
     curtailed = get("grid_sell.electricity_excess", units="kW")
@@ -411,7 +412,7 @@ def test_lp_arbitrage_example(subtests, temp_copy_of_example):
         assert unmet.sum() == pytest.approx(0.0, abs=1e-6)
 
     with subtests.test("Commodity balance closes"):
-        supply = solar + imported + spill + discharge - charge
+        supply = imported + spill + discharge - charge
         assert np.allclose(supply, exported + curtailed, rtol=1e-6, atol=1e-6)
 
     with subtests.test("Round-trip efficiency is applied"):

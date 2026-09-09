@@ -436,6 +436,18 @@ class PoseOptimization:
             overwrite_recorder = self.config["recorder"].get("overwrite_recorder", False)
             recorder_path = Path(folder_output) / self.config["recorder"]["file"]
 
+            if overwrite_recorder:
+                # OpenMDAO's SqliteRecorder appends to an existing database and then
+                # fails when it tries to create tables that are already there, so the
+                # previous run's file has to go before the new recorder starts up.
+                try:
+                    recorder_path.unlink(missing_ok=True)
+                except OSError:
+                    # The file is still held open, usually by a recorder attached to
+                    # another model built in this same process, so fall back to a
+                    # unique name rather than failing the setup.
+                    overwrite_recorder = False
+
             if not overwrite_recorder:
                 # make a unique filename with the same base as self.config["recorder"]["file"]
                 # separate out the filename without the extension

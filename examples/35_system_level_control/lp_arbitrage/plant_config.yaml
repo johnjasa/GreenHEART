@@ -1,11 +1,11 @@
 name: plant_config
 description: >
-  A solar plus battery addition to an existing solar farm that serves a flat
-  on-site load. The LP values only the addition: it may sell no more than the
-  existing plant leaves unserved, and it may absorb the existing plant's spill.
-  The addition has no on-site load of its own, so its demand component is set to
-  zero and all of its production flows through ``unused_electricity_out`` to the
-  export grid connection.
+  A battery added to an existing solar farm that serves a flat on-site load. The
+  LP values only the addition: it may sell no more than the existing plant
+  leaves unserved, and it may absorb the existing plant's spill. The addition
+  has no on-site load of its own, so its demand component is set to zero and all
+  of its production flows through ``unused_electricity_out`` to the export grid
+  connection.
 sites:
   site:
     latitude: 30.6617
@@ -18,15 +18,14 @@ sites:
 technology_interconnections:
   # Existing plant: a solar farm serving a flat on-site load.
   - [existing_solar, existing_load_demand, electricity, cable]
-  # Source bus: solar and grid imports are aggregated into a single stream.
-  # Routing the import technology through this combiner is what physically
-  # enables grid charging, because the storage model clips charging to the
-  # commodity present at its input.
-  - [solar, charge_combiner, electricity, cable]
+  # Source bus: grid imports and the existing plant's spill are aggregated into
+  # a single stream. Routing the import technology through this combiner is what
+  # physically enables grid charging, because the storage model clips charging
+  # to the commodity present at its input.
   - [grid_buy, charge_combiner, electricity, cable]
   # The existing plant's spill is physically available to the battery, so it has
   # to reach the charge bus for the commanded schedule to be realizable.
-  - [existing_load_demand, charge_combiner, [unused_electricity_out, electricity_in3]]
+  - [existing_load_demand, charge_combiner, [unused_electricity_out, electricity_in2]]
   # The aggregated source feeds the battery and also flows straight through to
   # the delivery bus. A combiner is the only technology allowed to fan out to
   # both a storage component and a downstream combiner.
@@ -40,7 +39,6 @@ technology_interconnections:
   - [electrical_load_demand, grid_sell, [unused_electricity_out, electricity_set_point]]
   - [electrical_load_demand, grid_sell, [unused_electricity_out, electricity_in]]
 resource_to_tech_connections:
-  - [site.solar_resource, solar, solar_resource_data]
   - [site.solar_resource, existing_solar, solar_resource_data]
 plant:
   plant_life: 30
@@ -74,10 +72,11 @@ finance_parameters:
     profast_npv:
       finance_model: ProFastNPV
       model_inputs:
-        # Placeholder. The runner script overwrites this with the realized
-        # volume-weighted export price, which is what the arbitrage schedule
-        # actually earns and sits well above the simple time-average LMP.
-        commodity_sell_price: 0.05
+        # Zero on purpose. grid_sell already values every exported kilowatt-hour
+        # at that hour's LMP and reports it as negative VarOpEx, which ProFAST
+        # picks up as a coproduct. A nonzero price here would pay for the same
+        # energy a second time.
+        commodity_sell_price: 0.0
         commodity_sell_price_units: USD/(kW*h)
         params:
           analysis_start_year: 2032
@@ -101,9 +100,14 @@ finance_parameters:
   finance_subgroups:
     electricity:
       commodity: electricity
-      commodity_stream: out_combiner
+      # Value what is actually sold, not what reaches the delivery bus. The
+      # export ceiling curtails a large share of the throughput at out_combiner,
+      # so using that stream would book revenue on energy that is never sold.
+      commodity_stream: grid_sell
+      use_commodity_stream_timeseries: true
+      commodity_stream_output: electricity_sold
       finance_groups: [profast_npv]
-      technologies: [solar, battery, grid_buy, grid_sell]
+      technologies: [battery, grid_buy, grid_sell]
   cost_adjustment_parameters:
     cost_year_adjustment_inflation: 0.025
     target_dollar_year: 2022

@@ -1,14 +1,34 @@
-"""LP-based energy arbitrage for a solar plus battery addition to an existing plant.
+"""Sweep the size of a merchant battery added to an existing solar plant.
 
 A synthetic hourly locational marginal price (LMP) series drives both the
 export price and the import price. The system-level controller solves a rolling
 24-hour linear program that decides, simultaneously, when to charge the battery
-(from solar, from the existing plant's spill, or from the grid), when to
-discharge, and how much to export. Export is capped at the existing plant's
-unmet demand, so only the value of the addition is counted.
+(from the existing plant's spill or from the grid), when to discharge, and how
+much to export. Export is capped at the existing plant's unmet demand, so only
+the value of the addition is counted.
+
+The battery is the only new asset. Its power rating is fixed by
+``tech_config.yaml`` and the sweep varies its energy capacity, so each case asks
+how many hours of storage are worth building behind a given inverter. The driver
+evaluates a full year of dispatch at each capacity and records the resulting net
+present value.
+
+Export revenue reaches the net present value through the grid cost model, which
+values every exported kilowatt-hour at that hour's LMP and reports the total as
+negative variable OpEx. ProFAST treats that as a coproduct, so
+``commodity_sell_price`` is set to zero in ``plant_config.yaml`` to keep the
+same energy from being paid for twice.
+
+The run writes three figures: the value curve over the swept capacities, and
+then the dispatch and the economics of whichever capacity came out best.
+
+Each case is a year of hourly linear programs, so the whole sweep takes a while.
 """
 
+from pathlib import Path
+
 import numpy as np
+import openmdao.api as om
 import matplotlib.pyplot as plt
 
 from h2integrate.core.h2integrate_model import H2IntegrateModel
@@ -19,7 +39,9 @@ def make_lmp_profile(n_timesteps=8760, seed=0):
 
     Combines a diurnal shape (an evening peak and a midday solar-driven trough
     that dips negative), a seasonal summer premium, and lognormal noise with
-    occasional scarcity spikes.
+    occasional scarcity spikes. The series averages about 30 USD/MWh and its
+    scarcity events reach several hundred USD/MWh, which is the spread the
+    battery earns against.
 
     Args:
         n_timesteps (int): Number of hourly timesteps.
@@ -50,7 +72,11 @@ def make_lmp_profile(n_timesteps=8760, seed=0):
     return price
 
 
-# -- Create and set up the model --
+# -- Create the model --
+n_timesteps = 8760
+dt_h = 1.0
+lmp = make_lmp_profile(n_timesteps)
+
 h2i = H2IntegrateModel("solar_battery_arbitrage.yaml")
 h2i.setup()
 
@@ -59,17 +85,68 @@ h2i.setup()
 # the grid cost model. The import price feeds the controller's marginal cost for
 # grid_buy and the purchase term of the cost model. A small adder on the import
 # side represents transmission and ancillary charges.
-n_timesteps = 8760
-lmp = make_lmp_profile(n_timesteps)
 h2i.prob.set_val("grid_sell.electricity_sell_price", lmp, units="USD/(kW*h)")
 h2i.prob.set_val("grid_buy.electricity_buy_price", lmp + 0.004, units="USD/(kW*h)")
 
 h2i.run()
+
+# -- Read the value curve the sweep traced out --
+sql_path = Path(__file__).parent / "outputs" / "battery_sizing_sweep.sql"
+cases = list(om.CaseReader(sql_path).get_cases())
+sweep_capacity = np.array(
+    [case.get_design_vars()["battery.storage_capacity"].item() for case in cases]
+)
+sweep_npv = np.array(
+    [case.get_objectives()["finance_subgroup_electricity.NPV_electricity"].item() for case in cases]
+)
+order = np.argsort(sweep_capacity)
+sweep_capacity = sweep_capacity[order]
+sweep_npv = sweep_npv[order]
+best_capacity = sweep_capacity[np.argmax(sweep_npv)]
+
+
+def sweep_output(name):
+    """Stack one recorded output across the sweep cases, ordered by battery capacity."""
+    return np.array([np.atleast_1d(case.outputs[name]) for case in cases])[order]
+
+
+sweep_capex = sweep_output("battery.CapEx").ravel()
+sweep_duration = sweep_output("battery.storage_duration").ravel()
+sweep_sold = sweep_output("grid_sell.electricity_sold")
+sweep_bought = sweep_output("grid_buy.electricity_out")
+
+sweep_revenue = (sweep_sold * lmp).sum(axis=1) * dt_h
+sweep_margin = sweep_revenue - (sweep_bought * (lmp + 0.004)).sum(axis=1) * dt_h
+
+print("\nBattery sizing sweep")
+header = ("Capacity (MWh)", "Duration (h)", "CapEx (MUSD)", "Margin (MUSD/yr)", "NPV (MUSD)")
+print("".join(f"{col:>18}" for col in header))
+for i, capacity in enumerate(sweep_capacity):
+    marker = "  <- best" if capacity == best_capacity else ""
+    print(
+        f"{capacity / 1e3:>18,.1f}{sweep_duration[i]:>18,.1f}{sweep_capex[i] / 1e6:>18,.1f}"
+        f"{sweep_margin[i] / 1e6:>18,.2f}{sweep_npv[i] / 1e6:>18,.2f}{marker}"
+    )
+
+# -- Plot the value curve --
+fig0, ax0 = plt.subplots(figsize=(8, 5))
+ax0.plot(sweep_capacity / 1e3, sweep_npv / 1e6, "o-", color="tab:blue")
+ax0.axhline(0.0, color="k", linewidth=0.8, linestyle=":")
+ax0.set_xlabel("Battery energy capacity (MWh), at a fixed power rating")
+ax0.set_ylabel("NPV (MUSD)")
+ax0.set_title("Value of the addition against battery capacity")
+ax0.grid(alpha=0.3)
+plt.tight_layout()
+plt.savefig("lp_arbitrage_sizing.png", dpi=150)
+print("Plot saved to lp_arbitrage_sizing.png")
+
+# The driver leaves the model on whichever case ran last, so put it back on the
+# best capacity before pulling out the hourly schedule the figures below describe.
+h2i.prob.set_val("battery.storage_capacity", best_capacity, units="kW*h")
+h2i.prob.run_model()
 h2i.post_process()
 
 # -- Extract results --
-solar_out = h2i.prob.get_val("plant.solar.electricity_out", units="kW")
-battery_net = h2i.prob.get_val("plant.battery.electricity_out", units="kW")
 battery_discharge = h2i.prob.get_val("plant.battery.storage_electricity_discharge", units="kW")
 # The storage model reports charging as a negative rate; flip it to a magnitude.
 battery_charge = -h2i.prob.get_val("plant.battery.storage_electricity_charge", units="kW")
@@ -83,30 +160,29 @@ export_ceiling = h2i.prob.get_val(
 existing_spill = h2i.prob.get_val("plant.existing_load_demand.unused_electricity_out", units="kW")
 interconnection_limit = h2i.prob.get_val("plant.grid_sell.interconnection_size", units="kW").item()
 
-dt_h = 1.0
+charge_rate = h2i.prob.get_val("plant.battery.max_charge_rate", units="kW").item()
+storage_capacity = h2i.prob.get_val("plant.battery.storage_capacity", units="kW*h").item()
+battery_capex = h2i.prob.get_val("plant.battery.CapEx", units="USD").item()
+utilization = h2i.prob.get_val("plant.battery.standard_capacity_factor")[0]
+
 export_revenue = float(np.sum(grid_export * lmp) * dt_h)
 import_cost = float(np.sum(grid_import * (lmp + 0.004)) * dt_h)
 
-# -- Value the plant with ProFAST NPV --
-# ProFastNPV applies a single price per year to total production, so feeding it
-# the raw time-average LMP would understate revenue: the schedule deliberately
-# sells into high-price hours. The realized volume-weighted price is the price
-# that reproduces the actual export revenue, and the ratio of the two is the
-# plant's capture rate. Finance is downstream of dispatch here, so re-running
-# with the realized price leaves the schedule untouched.
-realized_price = export_revenue / (grid_export.sum() * dt_h)
+# Volume-weighted price the schedule captured, versus the flat market average.
+realized_price = export_revenue / max(grid_export.sum() * dt_h, 1.0)
 time_average_price = float(lmp.mean())
-h2i.prob.set_val(
-    "finance_subgroup_electricity.sell_price_electricity", realized_price, units="USD/(kW*h)"
-)
-h2i.prob.run_model()
-
 npv = h2i.prob.get_val("finance_subgroup_electricity.NPV_electricity", units="USD").item()
 
+print("\nBest capacity in the sweep")
+print(f"Capacity:               {storage_capacity / 1e3:>12,.1f} MWh")
+print(f"Charge rate:            {charge_rate / 1e3:>12,.1f} MW")
+print(f"Storage duration:       {storage_capacity / charge_rate:>12,.2f} h")
+print(f"Battery CapEx:          {battery_capex / 1e6:>12,.1f} MUSD")
+print(f"Utilization factor:     {utilization:>12,.3f}")
 print(f"Annual export:          {grid_export.sum() * dt_h / 1e3:>12,.0f} MWh")
 print(f"Annual import:          {grid_import.sum() * dt_h / 1e3:>12,.0f} MWh")
 print(f"Battery throughput:     {battery_discharge.sum() * dt_h / 1e3:>12,.0f} MWh discharged")
-print(f"Equivalent full cycles: {battery_discharge.sum() * dt_h / 200000:>12,.1f}")
+print(f"Equivalent full cycles: {battery_discharge.sum() * dt_h / storage_capacity:>12,.1f}")
 print(f"Gross export revenue:   {export_revenue:>12,.0f} USD")
 print(f"Gross import cost:      {import_cost:>12,.0f} USD")
 print(f"Gross energy margin:    {export_revenue - import_cost:>12,.0f} USD")
@@ -132,21 +208,29 @@ fig, axes = plt.subplots(5, 1, figsize=(14, 15), sharex=True)
 axes[0].plot(hours, lmp[window] * 100, color="tab:red")
 axes[0].axhline(0.0, color="k", linewidth=0.8, linestyle=":")
 axes[0].set_ylabel("LMP (\u00a2/kWh)")
-axes[0].set_title("LP Arbitrage: Representative Summer Week")
+axes[0].set_title(
+    f"LP Arbitrage, Representative Summer Week  |  best capacity "
+    f"{storage_capacity / 1e3:,.0f} MWh at {charge_rate / 1e3:,.0f} MW"
+)
 
 axes[1].bar(
-    hours, solar_out[window] / 1e3, width=1.0, color="tab:orange", align="edge", label="Solar"
+    hours,
+    existing_spill[window] / 1e3,
+    width=1.0,
+    color="tab:orange",
+    align="edge",
+    label="Existing plant spill",
 )
 axes[1].bar(
     hours,
     grid_import[window] / 1e3,
     width=1.0,
-    bottom=solar_out[window] / 1e3,
+    bottom=existing_spill[window] / 1e3,
     color="tab:gray",
     align="edge",
     label="Grid import",
 )
-axes[1].set_ylabel("Supply (MW)")
+axes[1].set_ylabel("Chargeable supply (MW)")
 axes[1].legend(loc="upper right")
 
 axes[2].bar(
@@ -311,7 +395,8 @@ ax2[1, 1].legend(loc="lower right")
 ax2[1, 1].grid(alpha=0.3)
 
 fig2.suptitle(
-    f"LP Arbitrage Economics  |  capture rate "
+    f"LP Arbitrage Economics  |  {charge_rate / 1e3:,.0f} MW / "
+    f"{storage_capacity / 1e3:,.0f} MWh battery  |  capture rate "
     f"{100 * realized_price / time_average_price:.0f}%  |  NPV {npv / 1e6:,.1f} MUSD",
     fontsize=13,
 )
