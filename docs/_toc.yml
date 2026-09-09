@@ -115,6 +115,7 @@ parts:
       - file: developer_guide/adding_a_new_technology
       - file: developer_guide/class_structure
       - file: developer_guide/technology_model_types
+      - file: developer_guide/rolling_horizon_architecture
       - file: developer_guide/testing
       - file: developer_guide/features_not_currently_implemented
   - caption: Miscellaneous Resources

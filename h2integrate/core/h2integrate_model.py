@@ -9,6 +9,10 @@ import openmdao.api as om
 from h2integrate.core.utilities import create_xdsm_from_config
 from h2integrate.core.dict_utils import check_inputs
 from h2integrate.core.file_utils import get_path, find_file, load_yaml
+from h2integrate.core.rolling_horizon import (
+    create_rolling_horizon_plan,
+    require_implemented_runtime,
+)
 from h2integrate.core.supported_models import (
     no_cost_models,
     supported_models,
@@ -47,6 +51,14 @@ class H2IntegrateModel:
         self.technology_graph = self.create_technology_graph(
             self.plant_config.get("technology_interconnections", {})
         )
+
+        # Plan the future annual/window model boundary before constructing any
+        # OpenMDAO groups. The scaffold is intentionally read-only: current annual
+        # and steppable execution paths are unchanged while enabled is false.
+        self.rolling_horizon_plan = create_rolling_horizon_plan(
+            self.plant_config, self.technology_config
+        )
+        require_implemented_runtime(self.rolling_horizon_plan)
 
         # load in supported models
         self.supported_models = supported_models.copy()

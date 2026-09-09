@@ -85,6 +85,31 @@ properties:
             maximum: 14
         required: [dt, n_timesteps]
     required: [plant_life, simulation]
+  rolling_horizon:
+    type: object
+    description: Optional architecture scaffold for a reusable rolling-horizon operations problem
+    properties:
+      enabled:
+        type: boolean
+        description: Enable rolling-horizon execution when the runtime is implemented
+        default: false
+      prediction_horizon:
+        type: integer
+        description: Number of timesteps visible to each controller solve
+        minimum: 1
+      control_interval:
+        type: integer
+        description: Number of timesteps committed before the next controller solve
+        minimum: 1
+      steppable_technologies:
+        type: array
+        description: Technologies whose control and performance models belong in the window problem
+        minItems: 1
+        uniqueItems: true
+        items:
+          type: string
+    required: [prediction_horizon, control_interval, steppable_technologies]
+    additionalProperties: false
   technology_interconnections:
     type: array
     description: Array of arrays representing technology interconnections
