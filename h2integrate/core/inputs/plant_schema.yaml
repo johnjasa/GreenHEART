@@ -108,6 +108,13 @@ properties:
         uniqueItems: true
         items:
           type: string
+      initial_states:
+        type: object
+        description: Initial state values keyed by technology name and state name
+        additionalProperties:
+          type: object
+          additionalProperties:
+            type: number
     required: [prediction_horizon, control_interval, steppable_technologies]
     additionalProperties: false
   technology_interconnections:

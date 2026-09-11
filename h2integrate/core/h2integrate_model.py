@@ -10,8 +10,14 @@ from h2integrate.core.utilities import create_xdsm_from_config
 from h2integrate.core.dict_utils import check_inputs
 from h2integrate.core.file_utils import get_path, find_file, load_yaml
 from h2integrate.core.rolling_horizon import (
+    StorageSOCStateAdapter,
+    RollingHorizonComponent,
+    RollingHorizonController,
     create_rolling_horizon_plan,
-    require_implemented_runtime,
+    create_boundary_input_aliases,
+    create_boundary_output_aliases,
+    create_h2integrate_window_problem,
+    create_window_model_configuration,
 )
 from h2integrate.core.supported_models import (
     no_cost_models,
@@ -52,13 +58,17 @@ class H2IntegrateModel:
             self.plant_config.get("technology_interconnections", {})
         )
 
-        # Plan the future annual/window model boundary before constructing any
-        # OpenMDAO groups. The scaffold is intentionally read-only: current annual
-        # and steppable execution paths are unchanged while enabled is false.
+        # Plan the full-simulation/part-simulation boundary before constructing
+        # OpenMDAO groups. The existing path is unchanged while this is disabled.
         self.rolling_horizon_plan = create_rolling_horizon_plan(
             self.plant_config, self.technology_config
         )
-        require_implemented_runtime(self.rolling_horizon_plan)
+        self.rolling_horizon_enabled = bool(
+            self.rolling_horizon_plan and self.rolling_horizon_plan.enabled
+        )
+        if self.rolling_horizon_enabled:
+            simulation = self.plant_config["plant"]["simulation"]
+            simulation["n_steps_per_compute"] = simulation["n_timesteps"]
 
         # load in supported models
         self.supported_models = supported_models.copy()
@@ -87,6 +97,9 @@ class H2IntegrateModel:
         # these are OpenMDAO groups that contain all the components for each technology
         # they will need tech_config but not driver or plant config
         self.create_technology_models()
+
+        if self.rolling_horizon_enabled:
+            self.create_rolling_horizon_model()
 
         self.create_finance_model()
 
@@ -491,8 +504,10 @@ class H2IntegrateModel:
         self.plant = self.model.add_subsystem("plant", plant_group, promotes=["*"])
 
         # Identify whether concurrent simulation framework is required
-        if n_steps_per_compute := self.plant_config["plant"]["simulation"].get(
-            "n_steps_per_compute", False
+        if not self.rolling_horizon_enabled and (
+            n_steps_per_compute := self.plant_config["plant"]["simulation"].get(
+                "n_steps_per_compute", False
+            )
         ):
             n_timesteps = self.plant_config["plant"]["simulation"]["n_timesteps"]
 
@@ -905,6 +920,9 @@ class H2IntegrateModel:
             "IronComponent",
             "ArdWindPlantModel",
         ]
+        rolling_placements = (
+            self.rolling_horizon_plan.full_sim_model_roles if self.rolling_horizon_enabled else {}
+        )
 
         if any(tech == "site" for tech in self.technology_config["technologies"]):
             msg = (
@@ -935,6 +953,10 @@ class H2IntegrateModel:
         # Create a technology group for each technology
         for tech_name, individual_tech_config in self.technology_config["technologies"].items():
             perf_model = individual_tech_config.get("performance_model", {}).get("model")
+            perf_cls = self.supported_models.get(perf_model)
+            classifier = getattr(perf_cls, "_control_classifier", None)
+            if classifier is not None:
+                self.tech_control_classifiers[tech_name] = classifier
 
             if "control_parameters" in individual_tech_config["model_inputs"]:
                 if "tech_name" in individual_tech_config["model_inputs"]["control_parameters"]:
@@ -1005,12 +1027,15 @@ class H2IntegrateModel:
 
                 # Process the models
                 # TODO: integrate financial_model into the loop below
-                model_types = [
-                    "dispatch_rule_set",
-                    "control_strategy",
-                    "performance_model",
-                    "cost_model",
-                ]
+                if tech_name in rolling_placements:
+                    model_types = list(rolling_placements[tech_name])
+                else:
+                    model_types = [
+                        "dispatch_rule_set",
+                        "control_strategy",
+                        "performance_model",
+                        "cost_model",
+                    ]
 
                 perf_om_object = None
                 for model_type in model_types:
@@ -1071,6 +1096,52 @@ class H2IntegrateModel:
                 )
                 self._check_time_step(tech_name, comp)
                 self.plant.add_subsystem(tech_name, comp)
+
+    def create_rolling_horizon_model(self):
+        """Add the part-simulation controller component to the full-simulation plant."""
+        plan = self.rolling_horizon_plan
+        configuration = create_window_model_configuration(
+            self.driver_config,
+            self.plant_config,
+            self.technology_config,
+            plan,
+        )
+        state_adapters = []
+        for tech_name, states in plan.initial_states.items():
+            unsupported_states = set(states) - {"soc"}
+            if unsupported_states:
+                raise NotImplementedError(
+                    f"Rolling-horizon states are not implemented for {tech_name}: "
+                    f"{sorted(unsupported_states)}"
+                )
+            tech_config = self.technology_config["technologies"][tech_name]
+            component_paths = tuple(
+                f"plant.{tech_name}.{tech_config[role]['model']}"
+                for role in plan.window_model_roles[tech_name]
+                if role in ("control_strategy", "performance_model")
+            )
+            state_adapters.append(StorageSOCStateAdapter(tech_name, component_paths))
+
+        self.rolling_horizon_input_aliases = create_boundary_input_aliases(plan, self.plant_config)
+        self.rolling_horizon_output_aliases = create_boundary_output_aliases(
+            plan, self.plant_config, self.technology_config
+        )
+        controller = RollingHorizonController(
+            plan,
+            configuration,
+            problem_factory=lambda config: create_h2integrate_window_problem(
+                config, self.supported_models
+            ),
+            state_adapters=tuple(state_adapters),
+        )
+        self.plant.add_subsystem(
+            "rolling_horizon",
+            RollingHorizonComponent(
+                controller=controller,
+                input_aliases=self.rolling_horizon_input_aliases,
+                output_aliases=self.rolling_horizon_output_aliases,
+            ),
+        )
 
     def _process_model(self, model_type, individual_tech_config, tech_group):
         # Generalized function to process model definitions
@@ -1605,10 +1676,28 @@ class H2IntegrateModel:
 
         combiner_counts = {}
         splitter_counts = {}
+        steppable = (
+            set(self.rolling_horizon_plan.steppable_technologies)
+            if self.rolling_horizon_enabled
+            else set()
+        )
+
+        if self.rolling_horizon_enabled:
+            for alias in self.rolling_horizon_input_aliases:
+                if alias.source is not None:
+                    self.plant.connect(alias.source, f"rolling_horizon.{alias.name}")
+            for alias in self.rolling_horizon_output_aliases:
+                for target in alias.targets:
+                    self.plant.connect(f"rolling_horizon.{alias.name}", target)
 
         # loop through each linkage and instantiate an OpenMDAO object (assume it exists) for
         # the connection type (e.g. cable, pipeline, etc)
         for connection in technology_interconnections:
+            source_tech, dest_tech = connection[:2]
+            if self.rolling_horizon_enabled and (
+                source_tech in steppable or dest_tech in steppable
+            ):
+                continue
             if len(connection) == 4:
                 source_tech, dest_tech, transport_item, transport_type = connection
 
@@ -1884,10 +1973,14 @@ class H2IntegrateModel:
 
                     if is_system_finance_model and perf_model not in no_replacement_schedule_models:
                         # connect replacement schedule to system-level finance models
-                        self.plant.connect(
-                            f"{tech_name}.replacement_schedule",
-                            f"finance_subgroup_{group_id}.replacement_schedule_{tech_name}",
-                        )
+                        if not (
+                            self.rolling_horizon_enabled
+                            and tech_name in set(self.rolling_horizon_plan.steppable_technologies)
+                        ):
+                            self.plant.connect(
+                                f"{tech_name}.replacement_schedule",
+                                f"finance_subgroup_{group_id}.replacement_schedule_{tech_name}",
+                            )
 
         self.plant.options["auto_order"] = True
 
@@ -1953,8 +2046,10 @@ class H2IntegrateModel:
             self.plant.linear_solver = om.DirectSolver()
 
         # Identify whether steppable simulation framework is required
-        if n_steps_per_compute := self.plant_config["plant"]["simulation"].get(
-            "n_steps_per_compute", False
+        if not self.rolling_horizon_enabled and (
+            n_steps_per_compute := self.plant_config["plant"]["simulation"].get(
+                "n_steps_per_compute", False
+            )
         ):
             n_timesteps = self.plant_config["plant"]["simulation"]["n_timesteps"]
             if n_steps_per_compute != n_timesteps:
@@ -1994,9 +2089,14 @@ class H2IntegrateModel:
         self.state = State.SETUP
 
         for tech, tech_info in self.technology_config["technologies"].items():
+            if self.rolling_horizon_enabled and tech in set(
+                self.rolling_horizon_plan.steppable_technologies
+            ):
+                continue
             check_inputs(self.prob, tech, tech_info, self.tech_config_path)
         self._validate_technology_interconnections()
-        self._check_tech_connections()
+        if not self.rolling_horizon_enabled:
+            self._check_tech_connections()
 
     def run(self):
         # do model setup based on the driver config
